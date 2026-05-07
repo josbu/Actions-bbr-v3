@@ -30,8 +30,7 @@ jobs:
       ARCH: ${{ matrix.arch }}
       KERNEL_VERSION: ""
     steps:
-      - name: 获取内核版本
-        id: get_kernel_version
+      - name: 获取最新 stable 内核版本
         run: |
           version=$(curl -s https://www.kernel.org \
             | grep -A1 -m1 "stable:" \
@@ -46,7 +45,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git build-essential \
-            libncurses-dev libssl-dev libelf-dev \
+            libncurses-dev libssl-dev libelf-dev libdw-dev \
             bison bc flex rsync debhelper \
             dpkg-dev fakeroot kmod cpio dwarves \
             lz4 zstd xz-utils curl jq
@@ -54,19 +53,81 @@ jobs:
       - name: 创建源码目录
         run: mkdir -p ./kernel/linux
 
-      - name: 下载内核源代码
+      - name: 下载最新 stable 内核源代码
         working-directory: ./kernel
         run: |
           branch=$(echo "${{ env.KERNEL_VERSION }}" | grep -oP '^\d+\.\d+')
           git clone --depth=1 --branch linux-$branch.y \
             https://github.com/gregkh/linux.git linux
 
-      - name: 添加 Google BBRv3
+      - name: 移植 Google BBR v3 补丁到 stable 基线
         working-directory: ./kernel/linux
         run: |
+          set -euo pipefail
           git remote add google-bbr https://github.com/google/bbr.git
-          git fetch google-bbr
-          git checkout google-bbr/v3
+          git fetch --no-tags --depth=256 google-bbr v3
+
+          base="$(git merge-base HEAD google-bbr/v3 || true)"
+          if [ -z "$base" ]; then
+            for deepen in 256 512 1024 2048; do
+              git fetch --no-tags --deepen="$deepen" google-bbr v3
+              base="$(git merge-base HEAD google-bbr/v3 || true)"
+              [ -n "$base" ] && break
+            done
+          fi
+
+          if [ -z "$base" ]; then
+            echo "ERROR: 无法找到 stable 与 google-bbr/v3 的共同祖先，停止构建。"
+            exit 1
+          fi
+
+          commits="$(git rev-list --reverse --no-merges "${base}..google-bbr/v3")"
+          if [ -z "$commits" ]; then
+            echo "ERROR: 未检测到可移植的 BBRv3 补丁提交，停止构建。"
+            exit 1
+          fi
+
+          total="$(echo "$commits" | wc -l | tr -d ' ')"
+          echo "Found $total commits to port."
+          i=0
+          while IFS= read -r c; do
+            [ -z "$c" ] && continue
+            i=$((i + 1))
+            subject="$(git show -s --format='%s' "$c")"
+            echo "[$i/$total] cherry-pick $c $subject"
+
+            if git cherry-pick -x "$c"; then
+              continue
+            fi
+
+            conflict_files="$(git diff --name-only --diff-filter=U || true)"
+            if [ -n "$conflict_files" ]; then
+              echo "ERROR: cherry-pick 冲突于提交 $c"
+              echo "冲突文件列表："
+              echo "$conflict_files"
+              echo "最近相关历史（每个冲突文件各展示 5 条）："
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                echo "--- $f ---"
+                git log --oneline -n 5 -- "$f" || true
+              done <<< "$conflict_files"
+              git cherry-pick --abort || true
+              exit 1
+            fi
+
+            echo "WARN: 提交 $c 为空或已包含，执行 skip。"
+            git cherry-pick --skip || {
+              echo "ERROR: 无法 skip 当前提交 $c"
+              git cherry-pick --abort || true
+              exit 1
+            }
+          done <<< "$commits"
+
+      - name: 从源码读取版本号
+        working-directory: ./kernel/linux
+        run: |
+          echo "KERNEL_VERSION=$(make -s kernelversion)" >> $GITHUB_ENV
+          echo "Kernel version from source: $(make -s kernelversion)"
 
       - name: 编译声明
         working-directory: ./kernel/linux
@@ -78,21 +139,13 @@ jobs:
           
           tail -n 5 net/ipv4/tcp_bbr.c
 
-      - name: 更新 Makefile 中的版本号
-        working-directory: ./kernel/linux
-        run: |
-          IFS='.' read -r v p s <<< "${{ env.KERNEL_VERSION }}"
-          sed -i "s/^VERSION *=.*/VERSION = $v/" Makefile
-          sed -i "s/^PATCHLEVEL *=.*/PATCHLEVEL = $p/" Makefile
-          sed -i "s/^SUBLEVEL *=.*/SUBLEVEL = $s/" Makefile
-
       - name: 准备 .config 并禁用证书检查
         working-directory: ./kernel/linux
         run: |
           if [ "${{ matrix.arch }}" = "arm64" ]; then
-            curl -sSL https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/arm64.config > .config
+            cp "$GITHUB_WORKSPACE/arm64.config" .config
           else
-            curl -sSL https://raw.githubusercontent.com/byJoey/Actions-bbr-v3/main/x86-64.config > .config
+            cp "$GITHUB_WORKSPACE/x86-64.config" .config
           fi
 
           scripts/config --disable SYSTEM_TRUSTED_KEYS
