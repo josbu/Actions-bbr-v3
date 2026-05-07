@@ -64,12 +64,15 @@ jobs:
         working-directory: ./kernel/linux
         run: |
           set -euo pipefail
+          stable_branch="$(git rev-parse --abbrev-ref HEAD)"
+          fallback_to_v3="false"
           git remote add google-bbr https://github.com/google/bbr.git
           git fetch --no-tags --depth=256 google-bbr v3
 
           base="$(git merge-base HEAD google-bbr/v3 || true)"
           if [ -z "$base" ]; then
             for deepen in 256 512 1024 2048; do
+              git fetch --no-tags --deepen="$deepen" origin "$stable_branch"
               git fetch --no-tags --deepen="$deepen" google-bbr v3
               base="$(git merge-base HEAD google-bbr/v3 || true)"
               [ -n "$base" ] && break
@@ -77,51 +80,61 @@ jobs:
           fi
 
           if [ -z "$base" ]; then
-            echo "ERROR: 无法找到 stable 与 google-bbr/v3 的共同祖先，停止构建。"
-            exit 1
+            echo "WARN: 深度拉取后仍未找到共同祖先，尝试 unshallow。"
+            git fetch --no-tags --unshallow origin "$stable_branch" || true
+            git fetch --no-tags --unshallow google-bbr v3 || true
+            base="$(git merge-base HEAD google-bbr/v3 || true)"
           fi
 
-          commits="$(git rev-list --reverse --no-merges "${base}..google-bbr/v3")"
-          if [ -z "$commits" ]; then
-            echo "ERROR: 未检测到可移植的 BBRv3 补丁提交，停止构建。"
-            exit 1
+          if [ -z "$base" ]; then
+            echo "WARN: 无法找到共同祖先，回退为直接使用 google-bbr/v3 基线构建。"
+            git reset --hard google-bbr/v3
+            fallback_to_v3="true"
           fi
 
-          total="$(echo "$commits" | wc -l | tr -d ' ')"
-          echo "Found $total commits to port."
-          i=0
-          while IFS= read -r c; do
-            [ -z "$c" ] && continue
-            i=$((i + 1))
-            subject="$(git show -s --format='%s' "$c")"
-            echo "[$i/$total] cherry-pick $c $subject"
-
-            if git cherry-pick -x "$c"; then
-              continue
-            fi
-
-            conflict_files="$(git diff --name-only --diff-filter=U || true)"
-            if [ -n "$conflict_files" ]; then
-              echo "ERROR: cherry-pick 冲突于提交 $c"
-              echo "冲突文件列表："
-              echo "$conflict_files"
-              echo "最近相关历史（每个冲突文件各展示 5 条）："
-              while IFS= read -r f; do
-                [ -z "$f" ] && continue
-                echo "--- $f ---"
-                git log --oneline -n 5 -- "$f" || true
-              done <<< "$conflict_files"
-              git cherry-pick --abort || true
+          if [ "$fallback_to_v3" = "false" ]; then
+            commits="$(git rev-list --reverse --no-merges "${base}..google-bbr/v3")"
+            if [ -z "$commits" ]; then
+              echo "ERROR: 未检测到可移植的 BBRv3 补丁提交，停止构建。"
               exit 1
             fi
 
-            echo "WARN: 提交 $c 为空或已包含，执行 skip。"
-            git cherry-pick --skip || {
-              echo "ERROR: 无法 skip 当前提交 $c"
-              git cherry-pick --abort || true
-              exit 1
-            }
-          done <<< "$commits"
+            total="$(echo "$commits" | wc -l | tr -d ' ')"
+            echo "Found $total commits to port."
+            i=0
+            while IFS= read -r c; do
+              [ -z "$c" ] && continue
+              i=$((i + 1))
+              subject="$(git show -s --format='%s' "$c")"
+              echo "[$i/$total] cherry-pick $c $subject"
+
+              if git cherry-pick -x "$c"; then
+                continue
+              fi
+
+              conflict_files="$(git diff --name-only --diff-filter=U || true)"
+              if [ -n "$conflict_files" ]; then
+                echo "ERROR: cherry-pick 冲突于提交 $c"
+                echo "冲突文件列表："
+                echo "$conflict_files"
+                echo "最近相关历史（每个冲突文件各展示 5 条）："
+                while IFS= read -r f; do
+                  [ -z "$f" ] && continue
+                  echo "--- $f ---"
+                  git log --oneline -n 5 -- "$f" || true
+                done <<< "$conflict_files"
+                git cherry-pick --abort || true
+                exit 1
+              fi
+
+              echo "WARN: 提交 $c 为空或已包含，执行 skip。"
+              git cherry-pick --skip || {
+                echo "ERROR: 无法 skip 当前提交 $c"
+                git cherry-pick --abort || true
+                exit 1
+              }
+            done <<< "$commits"
+          fi
 
       - name: 从源码读取版本号
         working-directory: ./kernel/linux
