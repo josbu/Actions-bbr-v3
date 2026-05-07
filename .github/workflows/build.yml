@@ -66,6 +66,8 @@ jobs:
           set -euo pipefail
           stable_branch="$(git rev-parse --abbrev-ref HEAD)"
           fallback_to_v3="false"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add google-bbr https://github.com/google/bbr.git
           git fetch --no-tags --depth=256 google-bbr v3
 
@@ -93,13 +95,29 @@ jobs:
           fi
 
           if [ "$fallback_to_v3" = "false" ]; then
-            commits="$(git rev-list --reverse --no-merges "${base}..google-bbr/v3")"
+            commits="$(
+              git rev-list --reverse --no-merges "${base}..google-bbr/v3" -- \
+                net/ipv4/tcp_bbr.c \
+                net/ipv4/Kconfig \
+                net/ipv4/Makefile \
+                include/net/tcp.h \
+                include/linux/tcp.h \
+                include/uapi/linux/tcp.h
+            )"
             if [ -z "$commits" ]; then
               echo "ERROR: 未检测到可移植的 BBRv3 补丁提交，停止构建。"
               exit 1
             fi
 
             total="$(echo "$commits" | wc -l | tr -d ' ')"
+            if [ "$total" -gt 200 ]; then
+              echo "WARN: BBR 相关提交数量异常（$total），回退为直接使用 google-bbr/v3 基线构建。"
+              git reset --hard google-bbr/v3
+              fallback_to_v3="true"
+            fi
+          fi
+
+          if [ "$fallback_to_v3" = "false" ]; then
             echo "Found $total commits to port."
             i=0
             while IFS= read -r c; do
@@ -110,6 +128,11 @@ jobs:
 
               if git cherry-pick -x "$c"; then
                 continue
+              fi
+
+              if ! git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null; then
+                echo "ERROR: cherry-pick 非冲突失败于提交 $c"
+                exit 1
               fi
 
               conflict_files="$(git diff --name-only --diff-filter=U || true)"
